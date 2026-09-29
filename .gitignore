@@ -1,0 +1,14 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.db
+bootstrap/.updater_state.json
+raw_html_storage/
+worker_tmp/
+System_Temp/
+Raw_HTML_Cache/
+Orders/
+Final_Deliveries/
+Buffer_Archives/
+.env.example
