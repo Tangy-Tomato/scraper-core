@@ -8,7 +8,6 @@ from worker.config import load_settings
 from worker.scraper import scrape
 from shared.exceptions import ApiClientError, CaptchaException, ScrapeException
 
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 shutdown_requested = False
@@ -43,7 +42,9 @@ def main() -> None:
                 continue
             idle_delay = settings.poll_min_seconds
             if task is None:
-                time.sleep(random.uniform(settings.poll_min_seconds, settings.poll_max_seconds))
+                time.sleep(
+                    random.uniform(settings.poll_min_seconds, settings.poll_max_seconds)
+                )
                 continue
             try:
                 logger.info("Scraping task %s (%s)", task.task_id, task.target_url)
@@ -69,3 +70,61 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ---------
+import sys
+import time
+import zlib
+import asyncio
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+
+from worker.hardware import resolve_optimal_concurrency
+from worker.api_client import MasterClient
+from worker.scraper import execute_scrape_task
+from worker.config import WORKER_CONFIG
+
+
+async def run_worker_thread(client: MasterClient, worker_idx: int):
+    while True:
+        task = await client.acquire_task()
+        if not task:
+            await asyncio.sleep(10)
+            continue
+
+        task_id = task["id"]
+        target_url = task["target_url"]
+
+        try:
+            # Run extraction inside headless Chromium
+            html_content, status = await execute_scrape_task(target_url)
+
+            if status == "SUCCESS":
+                # In-memory streaming compression
+                compressed_payload = zlib.compress(html_content.encode("utf-8"))
+                await client.submit_result(task_id, compressed_payload)
+            else:
+                await client.fail_task(task_id, reason=status)
+
+        except Exception as exc:
+            await client.fail_task(task_id, reason=str(exc))
+
+        await asyncio.sleep(2)
+
+
+async def main():
+    client = MasterClient(WORKER_CONFIG)
+    concurrency = resolve_optimal_concurrency()
+
+    # Launch parallel extraction instances based on RAM allocation
+    tasks = [
+        asyncio.create_task(run_worker_thread(client, i)) for i in range(concurrency)
+    ]
+    await asyncio.gather(*tasks)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
