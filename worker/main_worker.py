@@ -1,130 +1,111 @@
-import logging
-import random
-import signal
+import sys
 import time
+import signal
+import random
+import multiprocessing
+from pathlib import Path
 
+CLUSTER_ROOT = Path(r"C:\ProgramData\GMapEliteCluster")
+REPO_DIR = CLUSTER_ROOT / "app" / "scraper-core"
+CONFIG_FILE = CLUSTER_ROOT / "config" / ".env"
+sys.path.insert(0, str(REPO_DIR))
+
+from worker.hardware import resolve_optimal_concurrency
 from worker.api_client import MasterApiClient
-from worker.config import load_settings
 from worker.scraper import scrape
 from shared.exceptions import ApiClientError, CaptchaException, ScrapeException
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
-shutdown_requested = False
+SHUTDOWN = False
 
 
-def request_shutdown(signum, frame) -> None:
-    global shutdown_requested
-    shutdown_requested = True
+def load_env() -> dict:
+    data = {}
+    if CONFIG_FILE.exists():
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    data[k] = v
+    return data
 
 
-def main() -> None:
-    signal.signal(signal.SIGINT, request_shutdown)
+def sig_handler(signum, frame):
+    global SHUTDOWN
+    SHUTDOWN = True
+
+
+def worker_process_entrypoint(worker_idx: int):
+    signal.signal(signal.SIGINT, sig_handler)
     if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, request_shutdown)
-    settings = load_settings()
+        signal.signal(signal.SIGTERM, sig_handler)
+
+    env = load_env()
     client = MasterApiClient(
-        settings.master_url, settings.auth_token, settings.worker_id, settings.version
+        base_url=env.get("MASTER_URL", ""),
+        auth_token=env.get("AUTH_TOKEN", ""),
+        worker_id=f"{env.get('WORKER_ID', 'node')}-{worker_idx}",
+        version=env.get("LOCAL_VERSION", "1.0.0")
     )
-    idle_delay = settings.poll_min_seconds
-    last_heartbeat = 0.0
+
+    idle_delay = 5.0
+    last_hb = 0.0
+
     try:
-        while not shutdown_requested:
-            try:
-                if time.monotonic() - last_heartbeat >= 60:
+        while not SHUTDOWN:
+            if time.monotonic() - last_hb >= 60:
+                try:
                     client.heartbeat()
-                    last_heartbeat = time.monotonic()
+                    last_hb = time.monotonic()
+                except Exception:
+                    pass
+
+            try:
                 task = client.acquire()
             except ApiClientError:
-                logger.exception("Master API rejected the task acquisition request")
-                time.sleep(min(settings.poll_max_seconds, idle_delay))
-                idle_delay = min(settings.poll_max_seconds, idle_delay * 2)
+                time.sleep(idle_delay)
+                idle_delay = min(60.0, idle_delay * 1.5)
                 continue
-            idle_delay = settings.poll_min_seconds
-            if task is None:
-                time.sleep(
-                    random.uniform(settings.poll_min_seconds, settings.poll_max_seconds)
-                )
+
+            if not task:
+                time.sleep(random.uniform(5.0, 15.0))
                 continue
+
+            idle_delay = 5.0
             try:
-                logger.info("Scraping task %s (%s)", task.task_id, task.target_url)
-                html = scrape(task, settings.relay_dir)
+                # Scrape directly returns raw HTML string
+                html = scrape(task)
+                # Client gzip compresses and streams to Master
                 client.submit(task, html)
             except CaptchaException as exc:
-                logger.warning("Task %s hit CAPTCHA: %s", task.task_id, exc)
                 client.fail(task, str(exc), retryable=True)
-                time.sleep(60)
-            except ScrapeException as exc:
-                logger.exception("Task %s scrape failed", task.task_id)
+                time.sleep(60.0)
+            except (ScrapeException, Exception) as exc:
                 client.fail(task, str(exc), retryable=True)
-                time.sleep(random.uniform(2, 8))
-            except ApiClientError:
-                logger.exception(
-                    "Master rejected task %s; it will be recovered when its lease expires",
-                    task.task_id,
-                )
-                time.sleep(random.uniform(2, 8))
+                time.sleep(random.uniform(2.0, 5.0))
     finally:
         client.close()
 
 
-if __name__ == "__main__":
-    main()
-
-
-# ---------
-import sys
-import time
-import zlib
-import asyncio
-from pathlib import Path
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE_DIR))
-
-from worker.hardware import resolve_optimal_concurrency
-from worker.api_client import MasterClient
-from worker.scraper import execute_scrape_task
-from worker.config import WORKER_CONFIG
-
-
-async def run_worker_thread(client: MasterClient, worker_idx: int):
-    while True:
-        task = await client.acquire_task()
-        if not task:
-            await asyncio.sleep(10)
-            continue
-
-        task_id = task["id"]
-        target_url = task["target_url"]
-
-        try:
-            # Run extraction inside headless Chromium
-            html_content, status = await execute_scrape_task(target_url)
-
-            if status == "SUCCESS":
-                # In-memory streaming compression
-                compressed_payload = zlib.compress(html_content.encode("utf-8"))
-                await client.submit_result(task_id, compressed_payload)
-            else:
-                await client.fail_task(task_id, reason=status)
-
-        except Exception as exc:
-            await client.fail_task(task_id, reason=str(exc))
-
-        await asyncio.sleep(2)
-
-
-async def main():
-    client = MasterClient(WORKER_CONFIG)
+def main():
+    multiprocessing.freeze_support()
     concurrency = resolve_optimal_concurrency()
 
-    # Launch parallel extraction instances based on RAM allocation
-    tasks = [
-        asyncio.create_task(run_worker_thread(client, i)) for i in range(concurrency)
-    ]
-    await asyncio.gather(*tasks)
+    processes = []
+    for i in range(concurrency):
+        p = multiprocessing.Process(target=worker_process_entrypoint, args=(i + 1,), daemon=True)
+        p.start()
+        processes.append(p)
+
+    while True:
+        time.sleep(5)
+        # Check process liveness and resurrect crashed children
+        for idx, p in enumerate(processes):
+            if not p.is_alive():
+                new_p = multiprocessing.Process(target=worker_process_entrypoint, args=(idx + 1,), daemon=True)
+                new_p.start()
+                processes[idx] = new_p
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

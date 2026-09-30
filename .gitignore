@@ -12,3 +12,4 @@ Orders/
 Final_Deliveries/
 Buffer_Archives/
 .env.example
+operator_encrypt.py
