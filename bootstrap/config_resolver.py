@@ -1,10 +1,9 @@
 import json
 import os
-import urllib.request
 from pathlib import Path
+import urllib.request
 from cryptography.fernet import Fernet, InvalidToken
 
-# Target C:\ProgramData\GMapEliteCluster\config strictly
 CLUSTER_ROOT = Path(r"C:\ProgramData\GMapEliteCluster")
 CONFIG_DIR = CLUSTER_ROOT / "config"
 ENV_PATH = CONFIG_DIR / ".env"
@@ -35,10 +34,9 @@ def record_local_version(version: int) -> None:
 
 
 def fetch_and_apply_dead_drop(raw_repo_url: str, decryption_key: str) -> bool:
-    """
-    Pulls encrypted config from the dedicated GitHub config repository,
+    """Pulls encrypted config from the dedicated GitHub config repository,
     validates monotonic versioning, and rewrites config/.env atomically.
-    Preserves machine-static keys: DEAD_DROP_URL, DECRYPTION_KEY, WORKER_ID.
+    Preserves machine-static keys: CONFIG_RAW_URL, DEAD_DROP_URL, DECRYPTION_KEY, WORKER_ID.
     """
     if not raw_repo_url or not decryption_key:
         return False
@@ -58,7 +56,7 @@ def fetch_and_apply_dead_drop(raw_repo_url: str, decryption_key: str) -> bool:
     except Exception:
         return False
 
-    # 2. Decrypt ciphertext using pre-seeded local Fernet key
+    # 2. Decrypt ciphertext using local Fernet key
     try:
         cipher = Fernet(decryption_key.encode("utf-8"))
         decrypted_bytes = cipher.decrypt(ciphertext)
@@ -84,7 +82,7 @@ def fetch_and_apply_dead_drop(raw_repo_url: str, decryption_key: str) -> bool:
                     line = line.strip()
                     if line and not line.startswith("#") and "=" in line:
                         k, v = line.split("=", 1)
-                        if k in ("DEAD_DROP_URL", "DECRYPTION_KEY", "WORKER_ID"):
+                        if k in ("CONFIG_RAW_URL", "DEAD_DROP_URL", "DECRYPTION_KEY", "WORKER_ID"):
                             preserved_keys[k] = v
         except Exception:
             pass
