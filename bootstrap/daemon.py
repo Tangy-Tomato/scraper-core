@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 from socket import gethostname
+import shutil
 import subprocess
 import sys
 import time
@@ -26,7 +27,8 @@ if not PYTHONW_EXE.exists():
 
 PYTHON_CLI = Path(str(PYTHONW_EXE).replace("pythonw.exe", "python.exe"))
 
-GIT_EXE = CLUSTER_ROOT / "runtime" / "Git" / "cmd" / "git.exe"
+# Portable Git is preferred.
+PORTABLE_GIT_EXE = CLUSTER_ROOT / "runtime" / "Git" / "cmd" / "git.exe"
 
 sys.path.insert(0, str(REPO_DIR))
 
@@ -57,9 +59,11 @@ def rotate_log_if_needed(
                 backup_path.unlink()
 
             log_path.rename(backup_path)
+
             log_daemon(
                 f"Rotated {log_path.name} to {backup_path.name}"
             )
+
     except Exception as exc:
         log_daemon(
             f"Failed to rotate log {log_path.name}: {exc}"
@@ -104,6 +108,36 @@ def load_env_map() -> dict[str, str]:
         log_daemon(f"Failed to load {ENV_PATH}: {exc}")
 
     return data
+
+
+def get_git_executable() -> str:
+    """
+    Resolve Git executable.
+
+    Priority:
+        1. Bundled portable Git
+        2. Global/system Git available on PATH
+
+    Raises:
+        FileNotFoundError:
+            If neither portable nor global Git is available.
+    """
+
+    if PORTABLE_GIT_EXE.exists():
+        return str(PORTABLE_GIT_EXE)
+
+    global_git = shutil.which("git")
+
+    if global_git:
+        log_daemon(
+            f"Portable Git not found; using global Git: {global_git}"
+        )
+        return global_git
+
+    raise FileNotFoundError(
+        "Git executable not found. "
+        "Neither bundled portable Git nor global Git is available."
+    )
 
 
 def check_for_updates(
@@ -197,17 +231,16 @@ def configure_git_remote(env_map: dict[str, str]) -> None:
     branch = env_map.get("MAIN_REPO_BRANCH", "main").strip() or "main"
 
     if not repo_url:
-        log_daemon("MAIN_REPO_URL is missing; Git remote unchanged.")
+        log_daemon(
+            "MAIN_REPO_URL is missing; Git remote unchanged."
+        )
         return
 
-    if not GIT_EXE.exists():
-        raise FileNotFoundError(
-            f"Bundled Git executable not found: {GIT_EXE}"
-        )
+    git_exe = get_git_executable()
 
     result = subprocess.run(
         [
-            str(GIT_EXE),
+            git_exe,
             "remote",
             "get-url",
             "origin",
@@ -222,7 +255,7 @@ def configure_git_remote(env_map: dict[str, str]) -> None:
     if current_url != repo_url:
         subprocess.run(
             [
-                str(GIT_EXE),
+                git_exe,
                 "remote",
                 "set-url",
                 "origin",
@@ -240,7 +273,7 @@ def configure_git_remote(env_map: dict[str, str]) -> None:
 
     subprocess.run(
         [
-            str(GIT_EXE),
+            git_exe,
             "config",
             "remote.origin.fetch",
             f"+refs/heads/{branch}:refs/remotes/origin/{branch}",
@@ -260,11 +293,19 @@ def apply_git_update(env_map: dict[str, str]) -> bool:
     )
 
     try:
+        # Resolve Git once for the entire update operation.
+        # Portable Git is preferred, global Git is the fallback.
+        git_exe = get_git_executable()
+
+        log_daemon(
+            f"Using Git executable: {git_exe}"
+        )
+
         configure_git_remote(env_map)
 
         subprocess.run(
             [
-                str(GIT_EXE),
+                git_exe,
                 "fetch",
                 "--prune",
                 "origin",
@@ -278,7 +319,7 @@ def apply_git_update(env_map: dict[str, str]) -> bool:
 
         subprocess.run(
             [
-                str(GIT_EXE),
+                git_exe,
                 "reset",
                 "--hard",
                 f"origin/{branch}",
@@ -335,10 +376,12 @@ def restart_worker(
 
     try:
         proc.wait(timeout=10)
+
     except subprocess.TimeoutExpired:
         log_daemon(
             "Worker did not terminate within 10 seconds; killing it."
         )
+
         proc.kill()
 
         try:
